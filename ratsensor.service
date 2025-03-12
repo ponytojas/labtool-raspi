@@ -1,0 +1,15 @@
+[Unit]
+Description=Rat Rack Sensor Monitoring
+After=network.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi
+ExecStart=/usr/bin/python3 /home/pi/ratsensor.py
+Restart=always
+RestartSec=10
+EnvironmentFile=/etc/ratsensor/mqtt_config.env
+
+[Install]
+WantedBy=multi-user.target
