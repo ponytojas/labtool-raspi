@@ -4,6 +4,7 @@ import time
 import uuid
 import json
 import logging
+from logging.handlers import TimedRotatingFileHandler
 import random
 from datetime import datetime
 import paho.mqtt.client as mqtt
@@ -20,15 +21,24 @@ except ImportError:
     print("Running in simulation mode - generating fake data")
 
 # Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler("/var/log/ratsensor.log", mode='a'),
-        logging.StreamHandler()
-    ]
-)
+log_file = "/var/log/ratsensor.log"
 logger = logging.getLogger("RatSensor")
+logger.setLevel(logging.INFO)
+
+# Create a timed rotating file handler that rotates every 7 days
+file_handler = TimedRotatingFileHandler(
+    filename=log_file,
+    when='D',        # 'D' for days
+    interval=7,      # Rotate every 7 days
+    backupCount=2,   # Keep 4 backup files (28 days of logs)
+)
+file_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+logger.addHandler(file_handler)
+
+# Add stream handler for console output
+stream_handler = logging.StreamHandler()
+stream_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+logger.addHandler(stream_handler)
 
 # Load environment variables from the specified path
 ENV_FILE = "/etc/ratsensor/mqtt_config.env"
@@ -52,17 +62,17 @@ def get_device_id():
     try:
         # Create directory if it doesn't exist
         os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
-        
+
         if os.path.exists(CONFIG_FILE):
             with open(CONFIG_FILE, 'r') as f:
                 data = json.load(f)
                 return data.get('device_id')
-        
+
         # Generate new ID if file doesn't exist
         device_id = str(uuid.uuid4())
         with open(CONFIG_FILE, 'w') as f:
             json.dump({'device_id': device_id}, f)
-        
+
         return device_id
     except Exception as e:
         logger.error(f"Error managing device ID: {e}")
@@ -77,19 +87,19 @@ def read_dht22_fake():
     # Higher temperature slightly increases humidity
     temp_effect = 0.2 * (temperature - TEMP_BASE)
     humidity = HUMID_BASE + random.uniform(-5.0, 5.0) + temp_effect
-    
+
     # Add time-of-day effect (warmer in afternoon, higher humidity in morning)
     hour = datetime.now().hour
     time_temp_effect = 2 * math.sin((hour - 6) * math.pi / 12)
     time_humid_effect = -1 * math.sin((hour - 9) * math.pi / 12)
-    
+
     temperature += time_temp_effect
     humidity += time_humid_effect
-    
+
     # Ensure values are within realistic ranges
     temperature = max(min(temperature, 32.0), 18.0)
     humidity = max(min(humidity, 95.0), 35.0)
-    
+
     return {
         "temperature": round(temperature, 1),
         "humidity": round(humidity, 1)
@@ -100,7 +110,7 @@ def read_dht22(pin=4):
     """Read temperature and humidity from DHT22 sensor."""
     if SIMULATION_MODE:
         return read_dht22_fake()
-        
+
     try:
         humidity, temperature = Adafruit_DHT.read_retry(Adafruit_DHT.DHT22, pin)
         if humidity is not None and temperature is not None:
@@ -119,17 +129,17 @@ def read_dht22(pin=4):
 def read_ltr390_fake():
     """Generate fake light sensor data."""
     hour = datetime.now().hour
-    
+
     # Generate a realistic day/night cycle
     # Peak at noon (hour 12), lowest at midnight (hour 0)
     time_factor = math.sin(hour * math.pi / 12) if hour <= 12 else math.sin((24 - hour) * math.pi / 12)
-    
+
     # Scale the light level based on time of day
     light_level = int(LIGHT_BASE * time_factor) + random.randint(-500, 500)
-    
+
     # Add some random noise
     light_level = max(0, light_level)  # Can't go below 0
-    
+
     return {"light": light_level}
 
 
@@ -137,7 +147,7 @@ def init_ltr390(bus):
     """Initialize the LTR390 light sensor."""
     if SIMULATION_MODE:
         return True
-        
+
     try:
         # Set to ALS mode (Ambient Light Sensing) with gain=3
         bus.write_byte_data(LTR390_ADDR, LTR390_MAIN_CTRL, 0x02)
@@ -152,16 +162,16 @@ def read_ltr390(bus):
     """Read light levels from LTR390 sensor."""
     if SIMULATION_MODE:
         return read_ltr390_fake()
-        
+
     try:
         # Read 3 bytes of ALS data
         data_0 = bus.read_byte_data(LTR390_ADDR, LTR390_ALS_DATA_0)
         data_1 = bus.read_byte_data(LTR390_ADDR, LTR390_ALS_DATA_1)
         data_2 = bus.read_byte_data(LTR390_ADDR, LTR390_ALS_DATA_2)
-        
+
         # Combine bytes into a light value (20 bits used)
         light = ((data_2 & 0x0F) << 16) | (data_1 << 8) | data_0
-        
+
         return {"light": light}
     except Exception as e:
         logger.error(f"Error reading LTR390: {e}")
@@ -173,7 +183,7 @@ def get_system_info():
     try:
         # Get uptime in seconds
         uptime = time.time() - psutil.boot_time()
-        
+
         return {
             "disk_percent": round(psutil.disk_usage('/').percent, 1),
             "memory_percent": round(psutil.virtual_memory().percent, 1),
@@ -200,7 +210,7 @@ def setup_mqtt():
         mqtt_port = int(os.environ.get('MQTT_PORT', '1883'))
         mqtt_user = os.environ.get('MQTT_USER')
         mqtt_pass = os.environ.get('MQTT_PASS')
-        
+
         # Handle URL format (tcp://hostname:port)
         if mqtt_broker_url.startswith('tcp://'):
             # Extract just the hostname part
@@ -210,21 +220,21 @@ def setup_mqtt():
                 mqtt_port = int(mqtt_broker_url.split(':')[-1])
         else:
             mqtt_broker = mqtt_broker_url
-        
+
         logger.info(f"Attempting to connect to MQTT broker at {mqtt_broker}:{mqtt_port}")
-        
+
         # Setup MQTT client with new API version
         client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
-        
+
         # Set username and password if provided
         if mqtt_user and mqtt_pass:
             client.username_pw_set(mqtt_user, mqtt_pass)
             logger.info("Using MQTT authentication")
-        
+
         # Connect to the broker
         client.connect(mqtt_broker, mqtt_port, 60)
         client.loop_start()
-        
+
         logger.info(f"Successfully connected to MQTT broker at {mqtt_broker}:{mqtt_port}")
         return client
     except ConnectionRefusedError:
@@ -238,24 +248,24 @@ def main():
     # Import math here to avoid dependency issues in simulation mode
     global math
     import math
-    
+
     # Get unique device ID
     device_id = get_device_id()
     logger.info(f"Starting sensor monitoring with device ID: {device_id}")
-    
+
     if SIMULATION_MODE:
         logger.info("Running in SIMULATION MODE - generating fake sensor data")
-    
+
     # Set up MQTT client
     mqtt_client = setup_mqtt()
     if not mqtt_client:
         logger.error("Failed to set up MQTT. Exiting.")
         return
-    
+
     # Configure sensor topics
     sensor_topic = SENSOR_TOPIC.format(device_id)
     info_topic = INFO_TOPIC.format(device_id)
-    
+
     # Initialize I2C bus for LTR390 (if not in simulation mode)
     i2c_bus = None
     if not SIMULATION_MODE:
@@ -266,19 +276,19 @@ def main():
                 logger.warning("LTR390 initialization failed")
         except Exception as e:
             logger.error(f"I2C bus initialization failed: {e}")
-    
+
     # Main loop
     while True:
         try:
             # Get current timestamp
             timestamp = datetime.now().isoformat() + 'Z'
-            
+
             # Read sensor data
             dht_data = read_dht22()
-            
+
             # Get light data
             light_data = read_ltr390(i2c_bus) if i2c_bus else read_ltr390_fake()
-            
+
             # Combine sensor data
             sensor_data = {
                 "timestamp": timestamp,
@@ -286,14 +296,14 @@ def main():
                 **dht_data,
                 **light_data
             }
-            
+
             # Get system information
             sys_info = {
                 "timestamp": timestamp,
                 "device_id": device_id,
                 **get_system_info()
             }
-            
+
             # Publish data if MQTT is available
             if mqtt_client:
                 mqtt_client.publish(sensor_topic, json.dumps(sensor_data))
@@ -305,10 +315,10 @@ def main():
                 logger.warning("MQTT client unavailable, data not published")
                 # Try to reconnect
                 mqtt_client = setup_mqtt()
-            
+
             # Wait for next interval
             time.sleep(INTERVAL)
-            
+
         except KeyboardInterrupt:
             logger.info("Stopping sensor monitoring")
             break
