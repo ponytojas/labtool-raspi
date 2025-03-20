@@ -231,9 +231,32 @@ def setup_mqtt():
             client.username_pw_set(mqtt_user, mqtt_pass)
             logger.info("Using MQTT authentication")
 
+        # Check if admin command listening is enabled
+        listen_for_admin = os.environ.get('LISTEN_FOR_ADMIN_COMMANDS', 'False').lower() in ('true', '1', 't')
+        admin_topic = os.environ.get('ADMIN_TOPIC')
+
+        if listen_for_admin and admin_topic:
+            logger.info(f"Admin command listening enabled. Will subscribe to topic: {admin_topic}")
+
+            # Define callback for when a message is received
+            def on_message(client, userdata, msg):
+                if msg.topic == admin_topic:
+                    logger.warning(f"Received admin command on topic {msg.topic}: {msg.payload.decode()}")
+                    logger.warning("System will reboot now")
+                    # Reboot the system
+                    os.system('sudo reboot')
+
+            # Set the callback
+            client.on_message = on_message
+
         # Connect to the broker
         client.connect(mqtt_broker, mqtt_port, 60)
         client.loop_start()
+
+        # Subscribe to admin topic if enabled
+        if listen_for_admin and admin_topic:
+            client.subscribe(admin_topic)
+            logger.info(f"Subscribed to admin topic: {admin_topic}")
 
         logger.info(f"Successfully connected to MQTT broker at {mqtt_broker}:{mqtt_port}")
         return client
@@ -243,6 +266,8 @@ def setup_mqtt():
     except Exception as e:
         logger.error(f"MQTT connection error: {e}")
         return None
+
+
 def main():
     """Main function to read sensors and publish data."""
     # Import math here to avoid dependency issues in simulation mode
@@ -255,6 +280,15 @@ def main():
 
     if SIMULATION_MODE:
         logger.info("Running in SIMULATION MODE - generating fake sensor data")
+
+    # Check if admin command listening is enabled
+    listen_for_admin = os.environ.get('LISTEN_FOR_ADMIN_COMMANDS', 'False').lower() in ('true', '1', 't')
+    admin_topic = os.environ.get('ADMIN_TOPIC')
+
+    if listen_for_admin and admin_topic:
+        logger.info(f"Admin command listening is enabled for topic: {admin_topic}")
+    else:
+        logger.info("Admin command listening is disabled")
 
     # Set up MQTT client
     mqtt_client = setup_mqtt()
@@ -315,6 +349,11 @@ def main():
                 logger.warning("MQTT client unavailable, data not published")
                 # Try to reconnect
                 mqtt_client = setup_mqtt()
+
+                # Resubscribe to admin topic if needed
+                if mqtt_client and listen_for_admin and admin_topic:
+                    mqtt_client.subscribe(admin_topic)
+                    logger.info(f"Resubscribed to admin topic: {admin_topic}")
 
             # Wait for next interval
             time.sleep(INTERVAL)
