@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 import os
+import sys
 import time
 import uuid
 import json
 import logging
 from logging.handlers import TimedRotatingFileHandler
 import random
-from datetime import datetime
+from datetime import datetime, timedelta
 import paho.mqtt.client as mqtt
-from dotenv import load_dotenv  # Added dotenv import
+from dotenv import load_dotenv
+import sqlite3
 
-# Import these libraries but don't require them for testing
 try:
     import Adafruit_DHT
     import smbus2
@@ -20,351 +21,532 @@ except ImportError:
     HARDWARE_AVAILABLE = False
     print("Running in simulation mode - generating fake data")
 
-# Configure logging
 log_file = "/var/log/ratsensor.log"
 logger = logging.getLogger("RatSensor")
 logger.setLevel(logging.INFO)
 
-# Create a timed rotating file handler that rotates every 7 days
 file_handler = TimedRotatingFileHandler(
-    filename=log_file,
-    when='D',        # 'D' for days
-    interval=7,      # Rotate every 7 days
-    backupCount=2,   # Keep 4 backup files (28 days of logs)
+    filename=log_file, when='D', interval=7, backupCount=2
 )
 file_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
 logger.addHandler(file_handler)
 
-# Add stream handler for console output
 stream_handler = logging.StreamHandler()
 stream_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
 logger.addHandler(stream_handler)
 
-# Load environment variables from the specified path
 ENV_FILE = "/etc/ratsensor/mqtt_config.env"
-load_dotenv(ENV_FILE)
-logger.info(f"Loaded environment variables from {ENV_FILE}")
+try:
+    if os.path.exists(ENV_FILE):
+        load_dotenv(ENV_FILE)
+        logger.info(f"Loaded environment variables from {ENV_FILE}")
+    else:
+        logger.warning(f"Environment file not found at {ENV_FILE}, using defaults/system environment.")
+except Exception as e:
+    logger.error(f"Error loading environment file {ENV_FILE}: {e}")
 
-# Constants
+
 CONFIG_FILE = "/etc/ratsensor/device_id.json"
+DATABASE_FILE = "/var/lib/ratsensor/sensor_data.db"
+DATABASE_SAVE_INTERVAL = 5
 SENSOR_TOPIC = "sensor/{}"
 INFO_TOPIC = "info/{}"
-INTERVAL = 30  # seconds
+INTERVAL = 30
 SIMULATION_MODE = os.environ.get('SIMULATION_MODE', 'False').lower() in ('true', '1', 't') or not HARDWARE_AVAILABLE
 
-# Set simulation parameters
-TEMP_BASE = 23.5    # Base temperature in °C
-HUMID_BASE = 55.0   # Base humidity %
-LIGHT_BASE = 8500   # Base light level
+INITIAL_MQTT_RETRY_DELAY = 15
+MAX_MQTT_RETRY_DELAY = 300
+MQTT_RETRY_BACKOFF_FACTOR = 2
+
+TEMP_BASE = 23.5
+HUMID_BASE = 55.0
+LIGHT_BASE = 8500
+
+mqtt_connected_flag = False
+
+def init_database():
+    db_dir = os.path.dirname(DATABASE_FILE)
+    try:
+        os.makedirs(db_dir, exist_ok=True)
+        logger.info(f"Ensured database directory exists: {db_dir}")
+    except OSError as e:
+        logger.error(f"Error creating database directory {db_dir}: {e}. Check permissions.")
+        return False
+
+    try:
+        conn = sqlite3.connect(DATABASE_FILE, timeout=10)
+        cursor = conn.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS sensor_readings (
+                timestamp TEXT PRIMARY KEY,
+                device_id TEXT NOT NULL,
+                temperature REAL,
+                humidity REAL,
+                light INTEGER
+            )
+        ''')
+        conn.commit()
+        conn.close()
+        logger.info(f"Database initialized successfully at {DATABASE_FILE}")
+        return True
+    except sqlite3.Error as e:
+        logger.error(f"Database initialization error: {e}")
+        return False
+
+def save_data_to_db(data_buffer):
+    if not data_buffer:
+        return
+    try:
+        conn = sqlite3.connect(DATABASE_FILE, timeout=10)
+        cursor = conn.cursor()
+        insert_data = [
+            (rec.get("timestamp"), rec.get("device_id"), rec.get("temperature"),
+             rec.get("humidity"), rec.get("light"))
+            for rec in data_buffer
+        ]
+        cursor.executemany('''
+            INSERT OR IGNORE INTO sensor_readings
+            (timestamp, device_id, temperature, humidity, light)
+            VALUES (?, ?, ?, ?, ?)
+        ''', insert_data)
+        conn.commit()
+        conn.close()
+        logger.info(f"Successfully saved {len(data_buffer)} records to database.")
+    except sqlite3.OperationalError as e:
+        if "locked" in str(e).lower():
+            logger.warning(f"Database is locked, could not save data this cycle: {e}")
+        else:
+            logger.error(f"Database operational error during save: {e}")
+    except sqlite3.Error as e:
+        logger.error(f"Failed to save data to database: {e}")
+    except Exception as e:
+        logger.error(f"Unexpected error during database save: {e}", exc_info=True)
 
 def get_device_id():
-    """Generate a unique device ID or retrieve existing one."""
+    config_dir = os.path.dirname(CONFIG_FILE)
     try:
-        # Create directory if it doesn't exist
-        os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
+        os.makedirs(config_dir, exist_ok=True)
+    except OSError as e:
+         logger.error(f"Error creating config directory {config_dir}: {e}. Check permissions.")
+         temp_id = f"temp-{uuid.uuid4()}"
+         logger.warning(f"Falling back to temporary device ID: {temp_id}")
+         return temp_id
 
+    try:
         if os.path.exists(CONFIG_FILE):
             with open(CONFIG_FILE, 'r') as f:
                 data = json.load(f)
-                return data.get('device_id')
+                device_id = data.get('device_id')
+                if device_id:
+                    logger.info(f"Retrieved existing device ID: {device_id}")
+                    return device_id
+                else:
+                    logger.warning(f"device_id key missing in {CONFIG_FILE}. Generating new one.")
 
-        # Generate new ID if file doesn't exist
         device_id = str(uuid.uuid4())
+        logger.info(f"Generated new device ID: {device_id}")
         with open(CONFIG_FILE, 'w') as f:
             json.dump({'device_id': device_id}, f)
-
+            logger.info(f"Saved new device ID to {CONFIG_FILE}")
         return device_id
-    except Exception as e:
-        logger.error(f"Error managing device ID: {e}")
-        # Fallback to a temporary ID if there's an error
-        return f"temp-{uuid.uuid4()}"
 
+    except (IOError, json.JSONDecodeError, OSError) as e:
+        logger.error(f"Error managing device ID file {CONFIG_FILE}: {e}")
+    except Exception as e:
+        logger.error(f"Unexpected error getting device ID: {e}", exc_info=True)
+
+    temp_id = f"temp-{uuid.uuid4()}"
+    logger.warning(f"Falling back to temporary device ID: {temp_id}")
+    return temp_id
 
 def read_dht22_fake():
-    """Generate fake temperature and humidity data with small variations."""
-    # Add some random variation to the base values
+    import math
     temperature = TEMP_BASE + random.uniform(-1.5, 1.5)
-    # Higher temperature slightly increases humidity
     temp_effect = 0.2 * (temperature - TEMP_BASE)
     humidity = HUMID_BASE + random.uniform(-5.0, 5.0) + temp_effect
-
-    # Add time-of-day effect (warmer in afternoon, higher humidity in morning)
     hour = datetime.now().hour
-    time_temp_effect = 2 * math.sin((hour - 6) * math.pi / 12)
-    time_humid_effect = -1 * math.sin((hour - 9) * math.pi / 12)
-
-    temperature += time_temp_effect
-    humidity += time_humid_effect
-
-    # Ensure values are within realistic ranges
-    temperature = max(min(temperature, 32.0), 18.0)
-    humidity = max(min(humidity, 95.0), 35.0)
-
-    return {
-        "temperature": round(temperature, 1),
-        "humidity": round(humidity, 1)
-    }
-
+    time_temp_effect = 1.5 * math.sin((hour - 9) * math.pi / 12)
+    time_humid_effect = 5.0 * math.sin((hour - 3) * math.pi / 12)
+    temperature = max(min(temperature + time_temp_effect, 32.0), 18.0)
+    humidity = max(min(humidity + time_humid_effect, 95.0), 35.0)
+    return {"temperature": round(temperature, 1), "humidity": round(humidity, 1)}
 
 def read_dht22(pin=4):
-    """Read temperature and humidity from DHT22 sensor."""
-    if SIMULATION_MODE:
+    if SIMULATION_MODE or not HARDWARE_AVAILABLE:
         return read_dht22_fake()
-
     try:
         humidity, temperature = Adafruit_DHT.read_retry(Adafruit_DHT.DHT22, pin)
         if humidity is not None and temperature is not None:
-            return {
-                "temperature": round(temperature, 1),
-                "humidity": round(humidity, 1)
-            }
+            return {"temperature": round(temperature, 1), "humidity": round(humidity, 1)}
         else:
-            logger.warning("Failed to get reading from DHT22 sensor")
+            logger.warning("DHT22: Failed to get reading (read_retry returned None)")
             return {"temperature": None, "humidity": None}
+    except RuntimeError as e:
+        logger.warning(f"DHT22: Sensor runtime error: {e}")
+        return {"temperature": None, "humidity": None}
     except Exception as e:
-        logger.error(f"DHT22 sensor error: {e}")
+        logger.error(f"DHT22: Unexpected sensor error", exc_info=True)
         return {"temperature": None, "humidity": None}
 
-
 def read_ltr390_fake():
-    """Generate fake light sensor data."""
+    import math
     hour = datetime.now().hour
-
-    # Generate a realistic day/night cycle
-    # Peak at noon (hour 12), lowest at midnight (hour 0)
-    time_factor = math.sin(hour * math.pi / 12) if hour <= 12 else math.sin((24 - hour) * math.pi / 12)
-
-    # Scale the light level based on time of day
-    light_level = int(LIGHT_BASE * time_factor) + random.randint(-500, 500)
-
-    # Add some random noise
-    light_level = max(0, light_level)  # Can't go below 0
-
+    time_factor = math.sin((hour - 7) * math.pi / 12)
+    normalized_factor = (time_factor + 1) / 2
+    light_level = max(0, int(LIGHT_BASE * normalized_factor) + random.randint(-500, 500))
     return {"light": light_level}
 
+if HARDWARE_AVAILABLE:
+    try:
+        import smbus2
+        LTR390_ADDR = 0x53
+        LTR390_MAIN_CTRL = 0x00
+        LTR390_ALS_CONF = 0x05
+        LTR390_ALS_DATA_0 = 0x0D
+    except ImportError:
+        logger.warning("smbus2 library not found, LTR390 hardware unavailable.")
+        HARDWARE_AVAILABLE = False
 
 def init_ltr390(bus):
-    """Initialize the LTR390 light sensor."""
-    if SIMULATION_MODE:
+    if SIMULATION_MODE or not HARDWARE_AVAILABLE:
+        logger.debug("LTR390 init skipped (Sim/No HW)")
         return True
-
+    if not bus:
+        logger.error("LTR390 init failed: I2C bus not provided.")
+        return False
     try:
-        # Set to ALS mode (Ambient Light Sensing) with gain=3
+        bus.write_byte_data(LTR390_ADDR, LTR390_ALS_CONF, 0x22)
         bus.write_byte_data(LTR390_ADDR, LTR390_MAIN_CTRL, 0x02)
         time.sleep(0.1)
+        logger.info("LTR390 initialized successfully.")
         return True
+    except OSError as e:
+        logger.error(f"LTR390: I2C communication error during init: {e}")
+        return False
     except Exception as e:
-        logger.error(f"Error initializing LTR390: {e}")
+        logger.error(f"LTR390: Unexpected error during init", exc_info=True)
         return False
 
-
 def read_ltr390(bus):
-    """Read light levels from LTR390 sensor."""
-    if SIMULATION_MODE:
+    if SIMULATION_MODE or not HARDWARE_AVAILABLE:
         return read_ltr390_fake()
-
+    if not bus:
+       logger.warning("LTR390 read failed: I2C bus not available.")
+       return {"light": None}
     try:
-        # Read 3 bytes of ALS data
-        data_0 = bus.read_byte_data(LTR390_ADDR, LTR390_ALS_DATA_0)
-        data_1 = bus.read_byte_data(LTR390_ADDR, LTR390_ALS_DATA_1)
-        data_2 = bus.read_byte_data(LTR390_ADDR, LTR390_ALS_DATA_2)
-
-        # Combine bytes into a light value (20 bits used)
-        light = ((data_2 & 0x0F) << 16) | (data_1 << 8) | data_0
-
+        data = bus.read_i2c_block_data(LTR390_ADDR, LTR390_ALS_DATA_0, 3)
+        light = data[0] | (data[1] << 8) | ((data[2] & 0x0F) << 16)
         return {"light": light}
+    except OSError as e:
+        logger.error(f"LTR390: I2C communication error during read: {e}")
+        return {"light": None}
     except Exception as e:
-        logger.error(f"Error reading LTR390: {e}")
+        logger.error(f"LTR390: Unexpected error during read", exc_info=True)
         return {"light": None}
 
-
 def get_system_info():
-    """Gather system information metrics."""
+    if not HARDWARE_AVAILABLE or 'psutil' not in sys.modules:
+         logger.debug("psutil not available, cannot get system info.")
+         return {"disk_percent": None, "memory_percent": None, "cpu_percent": None,
+                 "uptime_seconds": None, "uptime_human": None}
     try:
-        # Get uptime in seconds
-        uptime = time.time() - psutil.boot_time()
+        boot_time = psutil.boot_time()
+        current_time = time.time()
+        uptime_seconds = current_time - boot_time
+        delta = timedelta(seconds=uptime_seconds)
+        uptime_human = str(delta).split('.')[0]
 
         return {
             "disk_percent": round(psutil.disk_usage('/').percent, 1),
             "memory_percent": round(psutil.virtual_memory().percent, 1),
-            "cpu_percent": round(psutil.cpu_percent(interval=1), 1),
-            "uptime_seconds": int(uptime),
-            "uptime_human": str(datetime.utcfromtimestamp(uptime).strftime('%d days %H:%M:%S')).replace('00 days ', '')
+            "cpu_percent": round(psutil.cpu_percent(interval=0.5), 1),
+            "uptime_seconds": int(uptime_seconds),
+            "uptime_human": uptime_human
         }
     except Exception as e:
-        logger.error(f"Error getting system info: {e}")
-        return {
-            "disk_percent": None,
-            "memory_percent": None,
-            "cpu_percent": None,
-            "uptime_seconds": None,
-            "uptime_human": None
-        }
+        logger.error(f"Error getting system info", exc_info=True)
+        return {"disk_percent": None, "memory_percent": None, "cpu_percent": None,
+                "uptime_seconds": None, "uptime_human": None}
 
 
-def setup_mqtt():
-    """Configure and connect to MQTT broker using environment variables."""
+def on_connect(client, userdata, flags, rc, properties=None):
+    global mqtt_connected_flag
+    if rc == 0:
+        logger.info(f"MQTT: Successfully connected to broker (rc={rc})")
+        mqtt_connected_flag = True
+        admin_topic = userdata.get('admin_topic')
+        if admin_topic:
+            try:
+                result, mid = client.subscribe(admin_topic)
+                if result == mqtt.MQTT_ERR_SUCCESS:
+                    logger.info(f"MQTT: Subscribed to admin topic: {admin_topic}")
+                else:
+                    logger.warning(f"MQTT: Failed to subscribe to admin topic {admin_topic} (Error code: {result})")
+            except Exception as e:
+                logger.error(f"MQTT: Error during subscription to {admin_topic}", exc_info=True)
+    else:
+        logger.error(f"MQTT: Connection failed with result code: {rc}. Check broker/credentials/network.")
+        mqtt_connected_flag = False
+
+def on_disconnect(client, userdata, rc, properties=None):
+    global mqtt_connected_flag
+    logger.warning(f"MQTT: Disconnected from broker (rc={rc}). Paho client will attempt auto-reconnect.")
+    mqtt_connected_flag = False
+
+def on_message(client, userdata, msg):
+    admin_topic = userdata.get('admin_topic')
+    if msg.topic == admin_topic:
+        try:
+            payload = msg.payload.decode().strip().lower()
+            logger.warning(f"MQTT: Received command on admin topic '{msg.topic}': {payload}")
+            if payload == "reboot":
+                logger.warning("Executing reboot command...")
+                time.sleep(1)
+                os.system('sudo reboot')
+            else:
+                logger.warning(f"MQTT: Unknown admin command received: {payload}")
+        except Exception as e:
+            logger.error(f"MQTT: Error processing admin command", exc_info=True)
+
+def setup_mqtt(device_id):
+    global mqtt_connected_flag
+    mqtt_broker = None
+    mqtt_port = 1883
+    client = None
+
     try:
-        # Get MQTT configuration from environment variables loaded via dotenv
         mqtt_broker_url = os.environ.get('MQTT_BROKER', 'localhost')
-        mqtt_port = int(os.environ.get('MQTT_PORT', '1883'))
+        mqtt_port_str = os.environ.get('MQTT_PORT', '1883')
         mqtt_user = os.environ.get('MQTT_USER')
         mqtt_pass = os.environ.get('MQTT_PASS')
+        listen_for_admin = os.environ.get('LISTEN_FOR_ADMIN_COMMANDS', 'False').lower() in ('true', '1', 't')
+        admin_topic_base = os.environ.get('ADMIN_TOPIC')
 
-        # Handle URL format (tcp://hostname:port)
+        admin_topic = None
+        if listen_for_admin and admin_topic_base:
+             if "{}" in admin_topic_base:
+                 admin_topic = admin_topic_base.format(device_id)
+             else:
+                 admin_topic = admin_topic_base
+             logger.info(f"MQTT: Admin command listening enabled on topic: {admin_topic}")
+        else:
+            logger.info("MQTT: Admin command listening disabled.")
+
         if mqtt_broker_url.startswith('tcp://'):
-            # Extract just the hostname part
-            mqtt_broker = mqtt_broker_url.replace('tcp://', '').split(':')[0]
-            # If port is included in the URL, use that instead
-            if ':' in mqtt_broker_url.replace('tcp://', ''):
-                mqtt_port = int(mqtt_broker_url.split(':')[-1])
+            parts = mqtt_broker_url.replace('tcp://', '').split(':')
+            mqtt_broker = parts[0]
+            if len(parts) > 1:
+                try: mqtt_port = int(parts[1])
+                except ValueError: logger.error(f"Invalid port in MQTT_BROKER URL: {parts[1]}. Using default {mqtt_port}.")
+            else:
+                try: mqtt_port = int(mqtt_port_str)
+                except ValueError: logger.error(f"Invalid MQTT_PORT value: {mqtt_port_str}. Using default {mqtt_port}.")
         else:
             mqtt_broker = mqtt_broker_url
+            try: mqtt_port = int(mqtt_port_str)
+            except ValueError: logger.error(f"Invalid MQTT_PORT value: {mqtt_port_str}. Using default {mqtt_port}.")
 
-        logger.info(f"Attempting to connect to MQTT broker at {mqtt_broker}:{mqtt_port}")
+        if not mqtt_broker:
+            logger.error("MQTT Broker address is not configured. Cannot connect.")
+            return None
 
-        # Setup MQTT client with new API version
-        client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+        logger.info(f"MQTT: Attempting to connect to {mqtt_broker}:{mqtt_port}")
 
-        # Set username and password if provided
-        if mqtt_user and mqtt_pass:
-            client.username_pw_set(mqtt_user, mqtt_pass)
-            logger.info("Using MQTT authentication")
+        client_id = f"ratsensor-{device_id}-{random.randint(100, 999)}"
+        logger.debug(f"MQTT: Using Client ID: {client_id}")
 
-        # Check if admin command listening is enabled
-        listen_for_admin = os.environ.get('LISTEN_FOR_ADMIN_COMMANDS', 'False').lower() in ('true', '1', 't')
-        admin_topic = os.environ.get('ADMIN_TOPIC')
+        userdata = {'admin_topic': admin_topic}
 
-        if listen_for_admin and admin_topic:
-            logger.info(f"Admin command listening enabled. Will subscribe to topic: {admin_topic}")
-
-            # Define callback for when a message is received
-            def on_message(client, userdata, msg):
-                if msg.topic == admin_topic:
-                    logger.warning(f"Received admin command on topic {msg.topic}: {msg.payload.decode()}")
-                    logger.warning("System will reboot now")
-                    # Reboot the system
-                    os.system('sudo reboot')
-
-            # Set the callback
+        client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=client_id, userdata=userdata)
+        client.on_connect = on_connect
+        client.on_disconnect = on_disconnect
+        if admin_topic:
             client.on_message = on_message
 
-        # Connect to the broker
+        if mqtt_user and mqtt_pass:
+            client.username_pw_set(mqtt_user, mqtt_pass)
+            logger.info("MQTT: Using authentication.")
+
+        mqtt_connected_flag = False
         client.connect(mqtt_broker, mqtt_port, 60)
         client.loop_start()
 
-        # Subscribe to admin topic if enabled
-        if listen_for_admin and admin_topic:
-            client.subscribe(admin_topic)
-            logger.info(f"Subscribed to admin topic: {admin_topic}")
+        time.sleep(2)
 
-        logger.info(f"Successfully connected to MQTT broker at {mqtt_broker}:{mqtt_port}")
-        return client
+        if mqtt_connected_flag:
+             return client
+        else:
+            logger.warning("MQTT: Initial connection attempt failed or timed out.")
+            client.loop_stop()
+            return None
+
     except ConnectionRefusedError:
-        logger.error(f"Connection refused to MQTT broker at {mqtt_broker}:{mqtt_port}. Is the broker running?")
+        logger.error(f"MQTT: Connection refused by broker at {mqtt_broker}:{mqtt_port}. Check broker status and firewall.")
+        mqtt_connected_flag = False
+        if client and client.is_connected(): client.loop_stop()
+        return None
+    except OSError as e:
+        logger.error(f"MQTT: Network error connecting to {mqtt_broker}:{mqtt_port}: {e}")
+        mqtt_connected_flag = False
+        if client and client.is_connected(): client.loop_stop()
         return None
     except Exception as e:
-        logger.error(f"MQTT connection error: {e}")
+        logger.error(f"MQTT: Unexpected setup error", exc_info=True)
+        mqtt_connected_flag = False
+        if client and client.is_connected(): client.loop_stop()
         return None
 
-
 def main():
-    """Main function to read sensors and publish data."""
-    # Import math here to avoid dependency issues in simulation mode
-    global math
-    import math
-
-    # Get unique device ID
+    global mqtt_connected_flag
     device_id = get_device_id()
-    logger.info(f"Starting sensor monitoring with device ID: {device_id}")
-
-    if SIMULATION_MODE:
-        logger.info("Running in SIMULATION MODE - generating fake sensor data")
-
-    # Check if admin command listening is enabled
-    listen_for_admin = os.environ.get('LISTEN_FOR_ADMIN_COMMANDS', 'False').lower() in ('true', '1', 't')
-    admin_topic = os.environ.get('ADMIN_TOPIC')
-
-    if listen_for_admin and admin_topic:
-        logger.info(f"Admin command listening is enabled for topic: {admin_topic}")
-    else:
-        logger.info("Admin command listening is disabled")
-
-    # Set up MQTT client
-    mqtt_client = setup_mqtt()
-    if not mqtt_client:
-        logger.error("Failed to set up MQTT. Exiting.")
+    if not device_id or device_id.startswith("temp-"):
+        logger.critical("Failed to get a persistent device ID. Exiting.")
         return
 
-    # Configure sensor topics
+    logger.info(f"Starting RatSensor monitoring with device ID: {device_id}")
+
+    global SIMULATION_MODE
+    if SIMULATION_MODE:
+        logger.info("Running in SIMULATION MODE (Env var or missing libraries)")
+    elif not HARDWARE_AVAILABLE:
+        logger.warning("Hardware libraries missing, forcing SIMULATION MODE.")
+        SIMULATION_MODE = True
+
+    if not init_database():
+        logger.warning("Database initialization failed. Data will not be saved locally.")
+
     sensor_topic = SENSOR_TOPIC.format(device_id)
     info_topic = INFO_TOPIC.format(device_id)
 
-    # Initialize I2C bus for LTR390 (if not in simulation mode)
     i2c_bus = None
-    if not SIMULATION_MODE:
+    if not SIMULATION_MODE and HARDWARE_AVAILABLE:
         try:
-            i2c_bus = smbus2.SMBus(1)  # Use bus 1 for Raspberry Pi
-            ltr390_initialized = init_ltr390(i2c_bus)
-            if not ltr390_initialized:
-                logger.warning("LTR390 initialization failed")
+            import smbus2
+            i2c_bus = smbus2.SMBus(1)
+            logger.info("I2C bus 1 opened successfully.")
+            if not init_ltr390(i2c_bus):
+                 logger.warning("LTR390 initialization failed, light readings may be affected.")
+        except FileNotFoundError:
+            logger.error("I2C bus 1 not found. Is I2C enabled (raspi-config)? Forcing SIMULATION MODE.")
+            SIMULATION_MODE = True
+            HARDWARE_AVAILABLE = False
+        except ImportError:
+             logger.error("smbus2 library not found, cannot use I2C. Forcing SIMULATION MODE.")
+             SIMULATION_MODE = True
+             HARDWARE_AVAILABLE = False
         except Exception as e:
-            logger.error(f"I2C bus initialization failed: {e}")
+            logger.error(f"I2C bus initialization failed", exc_info=True)
+            i2c_bus = None
 
-    # Main loop
+    mqtt_client = None
+    current_mqtt_retry_delay = INITIAL_MQTT_RETRY_DELAY
+    last_mqtt_attempt_time = time.monotonic() - current_mqtt_retry_delay
+
+    measurement_count = 0
+    sensor_data_buffer = []
+
+    logger.info(f"Starting main loop. Reading sensors every {INTERVAL} seconds.")
     while True:
+        main_loop_start_time = time.monotonic()
+
         try:
-            # Get current timestamp
-            timestamp = datetime.now().isoformat() + 'Z'
+            if not mqtt_client or not mqtt_connected_flag:
+                if time.monotonic() - last_mqtt_attempt_time >= current_mqtt_retry_delay:
+                    logger.info(f"Attempting to establish MQTT connection (Retry delay: {current_mqtt_retry_delay}s)...")
+                    last_mqtt_attempt_time = time.monotonic()
 
-            # Read sensor data
+                    if mqtt_client:
+                        try:
+                            mqtt_client.loop_stop()
+                        except: pass
+
+                    mqtt_client = setup_mqtt(device_id)
+
+                    if not mqtt_client or not mqtt_connected_flag:
+                        logger.warning("MQTT connection attempt failed.")
+                        current_mqtt_retry_delay = min(
+                            current_mqtt_retry_delay * MQTT_RETRY_BACKOFF_FACTOR,
+                            MAX_MQTT_RETRY_DELAY
+                        )
+                        current_mqtt_retry_delay += random.uniform(0, 5)
+                    else:
+                        logger.info("MQTT connection established successfully.")
+                        current_mqtt_retry_delay = INITIAL_MQTT_RETRY_DELAY
+
+            timestamp_now = datetime.utcnow()
+            timestamp_iso = timestamp_now.isoformat() + 'Z'
             dht_data = read_dht22()
+            light_data = read_ltr390(i2c_bus)
 
-            # Get light data
-            light_data = read_ltr390(i2c_bus) if i2c_bus else read_ltr390_fake()
-
-            # Combine sensor data
-            sensor_data = {
-                "timestamp": timestamp,
-                "device_id": device_id,
-                **dht_data,
-                **light_data
+            current_sensor_data = {
+                "timestamp": timestamp_iso, "device_id": device_id,
+                "temperature": dht_data.get("temperature"),
+                "humidity": dht_data.get("humidity"),
+                "light": light_data.get("light")
             }
 
-            # Get system information
-            sys_info = {
-                "timestamp": timestamp,
-                "device_id": device_id,
-                **get_system_info()
+            sensor_data_buffer.append(current_sensor_data)
+            measurement_count += 1
+            if measurement_count >= DATABASE_SAVE_INTERVAL:
+                save_data_to_db(sensor_data_buffer)
+                sensor_data_buffer = []
+                measurement_count = 0
+
+            sys_info_data = get_system_info()
+            sys_info_payload = {
+                "timestamp": timestamp_iso, "device_id": device_id, **sys_info_data
             }
 
-            # Publish data if MQTT is available
-            if mqtt_client:
-                mqtt_client.publish(sensor_topic, json.dumps(sensor_data))
-                mqtt_client.publish(info_topic, json.dumps(sys_info))
-                logger.info(f"Published data: Temp: {dht_data.get('temperature')}°C, "
-                           f"Humidity: {dht_data.get('humidity')}%, "
-                           f"Light: {light_data.get('light')}")
+            if mqtt_client and mqtt_connected_flag:
+                try:
+                    sensor_result = mqtt_client.publish(sensor_topic, json.dumps(current_sensor_data), qos=0)
+                    info_result = mqtt_client.publish(info_topic, json.dumps(sys_info_payload), qos=0)
+                    logger.info(f"Published: T={current_sensor_data['temperature']} H={current_sensor_data['humidity']} L={current_sensor_data['light']}")
+                except Exception as pub_e:
+                    logger.error(f"MQTT Error during publish: {pub_e}")
+                    mqtt_connected_flag = False
             else:
-                logger.warning("MQTT client unavailable, data not published")
-                # Try to reconnect
-                mqtt_client = setup_mqtt()
+                logger.debug("MQTT client not connected, skipping publish.")
 
-                # Resubscribe to admin topic if needed
-                if mqtt_client and listen_for_admin and admin_topic:
-                    mqtt_client.subscribe(admin_topic)
-                    logger.info(f"Resubscribed to admin topic: {admin_topic}")
+            elapsed_time = time.monotonic() - main_loop_start_time
+            sleep_time = max(0, INTERVAL - elapsed_time)
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+            else:
+                 logger.warning(f"Main loop took {elapsed_time:.2f}s, longer than interval {INTERVAL}s.")
 
-            # Wait for next interval
-            time.sleep(INTERVAL)
 
         except KeyboardInterrupt:
-            logger.info("Stopping sensor monitoring")
+            logger.info("KeyboardInterrupt received. Stopping sensor monitoring...")
+            if sensor_data_buffer:
+                logger.info(f"Saving remaining {len(sensor_data_buffer)} records before exiting.")
+                save_data_to_db(sensor_data_buffer)
             break
         except Exception as e:
-            logger.error(f"Unexpected error in main loop: {e}")
-            time.sleep(5)  # Wait before retrying if there's an error
+            logger.error(f"Unexpected error in main loop", exc_info=True)
+            logger.info("Waiting 10 seconds before retrying...")
+            time.sleep(10)
+
+    logger.info("Exiting RatSensor script.")
+    if mqtt_client:
+        logger.info("Stopping MQTT client loop.")
+        mqtt_client.loop_stop()
+        logger.info("Disconnecting MQTT client.")
+        mqtt_client.disconnect()
+    if i2c_bus:
+        try:
+            logger.info("Closing I2C bus.")
+            i2c_bus.close()
+        except Exception as e:
+            logger.error(f"Error closing I2C bus: {e}")
+    logger.info("Cleanup complete.")
 
 
 if __name__ == "__main__":
+    if 'psutil' not in sys.modules and HARDWARE_AVAILABLE:
+        try:
+            import psutil
+        except ImportError:
+            logger.warning("psutil library not found, system info unavailable.")
+
     main()
