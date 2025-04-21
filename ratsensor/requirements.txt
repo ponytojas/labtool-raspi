@@ -1,0 +1,6 @@
+paho-mqtt
+python-dotenv
+# Add Adafruit_DHT, smbus2, psutil if hardware is expected
+# Adafruit-DHT # Might need specific install steps on RPi
+# smbus2
+# psutil
