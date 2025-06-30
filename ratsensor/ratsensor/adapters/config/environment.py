@@ -43,9 +43,8 @@ class EnvironmentConfigProvider(ConfigurationProvider):
                 # Determine simulation mode early
                 hw_available = True
                 try:
-                    import Adafruit_DHT
-                    import smbus2
-                    import psutil
+                    import adafruit_ltr390
+                    import adafruit_dht
                 except ImportError as e:
                     hw_available = False
                     logger.error(f"Failed to import hardware libraries: {e}")
@@ -59,7 +58,7 @@ class EnvironmentConfigProvider(ConfigurationProvider):
 
 
                 self._config = AppConfig(
-                    read_interval_seconds=get_env('READ_INTERVAL_SECONDS', 30, int),
+                    read_interval_seconds=get_env('READ_INTERVAL_SECONDS', 90, int),
                     db_save_interval_reads=get_env('DB_SAVE_INTERVAL_READS', 5, int),
                     mqtt_broker=get_env('MQTT_BROKER', 'localhost'),
                     mqtt_port=get_env('MQTT_PORT', 1883, int),
@@ -76,7 +75,7 @@ class EnvironmentConfigProvider(ConfigurationProvider):
                     database_file=get_env('DATABASE_FILE', '/var/lib/ratsensor/sensor_data.db'),
                     log_file=get_env('LOG_FILE', '/var/log/ratsensor/ratsensor.log'),
                     simulation_mode=simulation_mode,
-                    dht_pin=get_env('DHT_PIN', 14, int),
+                    dht_pin=get_env('DHT_PIN', 4, int),
                     i2c_bus_number=get_env('I2C_BUS_NUMBER', 1, int),
                 )
             except Exception as e:
