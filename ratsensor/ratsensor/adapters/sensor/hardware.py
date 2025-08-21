@@ -121,25 +121,45 @@ class HardwareSensorReader(SensorReader):
         if not self.dht:
             # logger.debug("DHT22 read skipped: sensor not initialized.")
             return {"temperature": None, "humidity": None}
-        try:
-            # Use properties of the adafruit_dht object
-            temperature_c = self.dht.temperature
-            humidity = self.dht.humidity
-            # adafruit_dht automatically retries internally to some extent
-            # It will raise RuntimeError if it fails after retries
-            if temperature_c is not None and humidity is not None:
-                 return {"temperature": round(temperature_c, 1), "humidity": round(humidity, 1)}
-            else:
-                 # This case might be less common with adafruit_dht compared to Adafruit_DHT
-                 logger.warning("DHT22: Read returned None values (unexpected for adafruit_dht).")
-                 return {"temperature": None, "humidity": None}
-        except RuntimeError as e:
-            # This is the expected error for read failures with adafruit_dht
-            logger.warning(f"DHT22: Failed to get reading: {e}")
-            return {"temperature": None, "humidity": None}
-        except Exception as e:
-            logger.error(f"DHT22: Unexpected sensor error during read", exc_info=True)
-            return {"temperature": None, "humidity": None}
+        
+        # Retry mechanism for DHT22 - these sensors are finicky
+        max_retries = 3
+        retry_delay = 0.5  # seconds
+        
+        for attempt in range(max_retries):
+            try:
+                # Use properties of the adafruit_dht object
+                temperature_c = self.dht.temperature
+                humidity = self.dht.humidity
+                # adafruit_dht automatically retries internally to some extent
+                # It will raise RuntimeError if it fails after retries
+                if temperature_c is not None and humidity is not None:
+                     if attempt > 0:
+                         logger.debug(f"DHT22: Successful read on attempt {attempt + 1}")
+                     return {"temperature": round(temperature_c, 1), "humidity": round(humidity, 1)}
+                else:
+                     # This case might be less common with adafruit_dht compared to Adafruit_DHT
+                     logger.warning("DHT22: Read returned None values (unexpected for adafruit_dht).")
+                     if attempt < max_retries - 1:
+                         time.sleep(retry_delay)
+                         continue
+                     return {"temperature": None, "humidity": None}
+            except RuntimeError as e:
+                # This is the expected error for read failures with adafruit_dht (checksum errors, etc.)
+                if attempt < max_retries - 1:
+                    logger.debug(f"DHT22: Attempt {attempt + 1} failed: {e}. Retrying...")
+                    time.sleep(retry_delay)
+                    continue
+                else:
+                    # Final attempt failed
+                    logger.warning(f"DHT22: Failed to get reading after {max_retries} attempts: {e}")
+                    return {"temperature": None, "humidity": None}
+            except Exception as e:
+                logger.error(f"DHT22: Unexpected sensor error during read", exc_info=True)
+                return {"temperature": None, "humidity": None}
+        
+        # Should not reach here, but just in case
+        return {"temperature": None, "humidity": None}
 
     def _read_ltr390(self) -> dict:
         if not self.ltr:
