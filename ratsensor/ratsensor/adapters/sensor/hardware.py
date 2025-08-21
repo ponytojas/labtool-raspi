@@ -92,9 +92,10 @@ class HardwareSensorReader(SensorReader):
             # Example: If dht_pin_number is 4, this gets board.D4
             pin_object = getattr(board, f'D{self.dht_pin_number}')
             logger.info(f"Attempting to initialize DHT22 on pin: {pin_object} (GPIO{self.dht_pin_number})")
-            # Pass use_pulseio=False if using libgpiod (often more reliable)
-            self.dht = adafruit_dht.DHT22(board.D14)
-            logger.info(f"DHT22 sensor initialized successfully (use_pulseio={not USE_LIBGPIOD}).")
+            # Pass use_pulseio=False for Raspberry Pi (often more reliable)
+            # This prevents the OverflowError: unsigned short is greater than maximum
+            self.dht = adafruit_dht.DHT22(pin_object, use_pulseio=False)
+            logger.info(f"DHT22 sensor initialized successfully on pin D{self.dht_pin_number} (use_pulseio=False).")
         except AttributeError:
             logger.error(f"Invalid DHT pin specified: D{self.dht_pin_number} not found in 'board' module.")
             self.dht = None
